@@ -1724,8 +1724,919 @@ impl fmt::Display for MusigSignError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate serde_json;
+
+    use self::serde_json::Value;
+    use crate::from_hex;
     use rand::{thread_rng, RngCore};
+
+    use secp256k1::schnorr::Signature;
     use {KeyPair, XOnlyPublicKey};
+
+    use core::str::FromStr;
+    use std::fs::File;
+    use std::io::prelude::*;
+    use std::path::Path;
+
+    // Notice 1
+    //
+    // The current secp256k1-zkp implementaion from Elements Project does not
+    // support variable length messages as described in issue #155 (see below).
+    // Therefore, this test suite will include, for the time being, a filter_155
+    // variable which will indicate whether to skip tests that include messages
+    // whose length does not equal 32 bytes.
+    //
+    // https://github.com/ElementsProject/secp256k1-zkp/issues/155
+
+    // Notice 2
+    //
+    // The current secp256k1-zkp implementaion from Elements Project does not
+    // support handling nonce generation in a manner conformant with the current
+    // spec. Therefore, nonce aggregation tests will need to be ignored for now.
+    // See the tracking issue below.
+    //
+    // https://github.com/ElementsProject/secp256k1-zkp/pull/192
+
+    // Notice 3
+    //
+    // This library currently uses G in place of 0 (zero). This has implications
+    // for, among other things, nonce aggregation. This test suite features
+    // various contortions to make up for this including: swapping out 0 and G
+    // when necessary and swapping out the expected signature with a different
+    // signature in sign_verify_vectors.json.
+
+    fn swap_out_g(input: &str) -> String {
+        // This musig implementation uses g for zero. So, we need to back out
+        // instances of g from our results and replace them with zero when
+        // necessary.
+        input.replace(
+            "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798",
+            "000000000000000000000000000000000000000000000000000000000000000000",
+        )
+    }
+
+    fn swap_in_g(input: &str) -> String {
+        input.replace(
+            "000000000000000000000000000000000000000000000000000000000000000000",
+            "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798",
+        )
+    }
+
+    fn to_hex(bytes: &[u8]) -> String {
+        let mut result = String::from("");
+        for (i, elem) in bytes.iter().enumerate() {
+            let foo = format!("{:02X}", elem);
+            result.push_str(&foo);
+        }
+        result
+    }
+
+    fn open_json(name: &str) -> Value {
+        let path = Path::new("src").join("zkp").join("test_vectors");
+        let path = path.join(name);
+
+        let display = path.display();
+
+        let mut file = match File::open(&path) {
+            Err(why) => panic!("couldn't open {}: {}", display, why),
+            Ok(file) => file,
+        };
+
+        let mut s = String::new();
+        file.read_to_string(&mut s).unwrap();
+
+        serde_json::from_str(s.as_str()).unwrap()
+    }
+
+    fn from_hex_32(hex: &str) -> Result<[u8; 32], ()> {
+        let mut buf = [0u8; 32];
+        from_hex(hex, &mut buf)?;
+        Ok(buf)
+    }
+
+    fn from_hex_132(hex: &str) -> Result<[u8; 132], ()> {
+        let mut buf = [0u8; 132];
+        from_hex(hex, &mut buf)?;
+        Ok(buf)
+    }
+
+    fn from_hex_all_32(list: Vec<&str>) -> Result<Vec<[u8; 32]>, ()> {
+        let mut result = vec![];
+        for entry in list.iter() {
+            let entry = from_hex_32(entry)?;
+            result.push(entry);
+        }
+        Ok(result)
+    }
+
+    fn from_hex_all_132(list: Vec<&str>) -> Result<Vec<[u8; 132]>, ()> {
+        let mut result = vec![];
+        for entry in list.iter() {
+            let entry = from_hex_132(entry)?;
+            result.push(entry);
+        }
+        Ok(result)
+    }
+
+    fn bytes_to_pubkeys(
+        list: Vec<[u8; 32]>,
+    ) -> Result<Vec<XOnlyPublicKey>, Box<dyn std::error::Error>> {
+        let mut result = vec![];
+        for entry in list.iter() {
+            let pk = XOnlyPublicKey::from_slice(entry)?;
+            result.push(pk)
+        }
+        Ok(result)
+    }
+
+    #[test]
+    fn test_key_agg_vectors() {
+        let secp = Secp256k1::new();
+
+        let test_data = open_json("key_agg_vectors.json");
+        let test_elements = test_data.as_object().unwrap();
+
+        let mut x: Vec<[u8; 32]> = vec![];
+        let mut t: Vec<[u8; 32]> = vec![];
+        let mut valid_test_cases: Vec<Value> = vec![];
+        let mut error_test_cases = vec![];
+
+        // Unpack and exhaust the json test file.
+        for (elem, value) in test_elements.iter() {
+            match elem.as_str() {
+                "pubkeys" => {
+                    let pubkeys: Vec<&str> = value
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap())
+                        .collect();
+                    x = from_hex_all_32(pubkeys).unwrap();
+                }
+                "tweaks" => {
+                    let tweaks: Vec<&str> = value
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap())
+                        .collect();
+                    t = from_hex_all_32(tweaks).unwrap();
+                }
+                "valid_test_cases" => {
+                    valid_test_cases = value.as_array().unwrap().to_vec();
+                }
+                "error_test_cases" => error_test_cases = value.as_array().unwrap().to_vec(),
+                unexpected => {
+                    panic!("Encountered unexpected test element: {}", unexpected)
+                }
+            }
+        }
+
+        for test_case in valid_test_cases.iter() {
+            let key_indices = test_case["key_indices"].as_array().unwrap();
+            let mut pub_keys: Vec<XOnlyPublicKey> = vec![];
+            for key_index in key_indices {
+                let index = key_index.as_u64().unwrap() as usize;
+                let key = x[index];
+                let key = XOnlyPublicKey::from_slice(&key).unwrap();
+                pub_keys.push(key);
+            }
+
+            let cache = MusigKeyAggCache::new(&secp, &pub_keys);
+            let agg_pk = cache.agg_pk();
+
+            let expected = test_case["expected"].as_str().unwrap();
+            let expected = XOnlyPublicKey::from_str(expected).unwrap();
+
+            assert_eq!(agg_pk, expected);
+        }
+
+        for test_case in error_test_cases.iter() {
+            let error_type = test_case["error"]["type"].as_str().unwrap();
+            match error_type {
+                "invalid_contribution" => {
+                    let key_indices = test_case["key_indices"].as_array().unwrap();
+                    let bad_signer = test_case["error"]["signer"].as_u64().unwrap() as usize;
+                    for (signer, key) in key_indices.iter().enumerate() {
+                        let index = key.as_u64().unwrap() as usize;
+                        let key = x[index];
+                        let result = XOnlyPublicKey::from_slice(&key);
+                        match result {
+                            Ok(_) => {
+                                assert_ne!(signer, bad_signer);
+                            }
+                            Err(err) => {
+                                assert_eq!(signer, bad_signer);
+                                assert_eq!(format!("{:?}", err), "InvalidPublicKey".to_string());
+                            }
+                        }
+                    }
+                }
+                "value" => {
+                    let key_indices = test_case["key_indices"].as_array().unwrap();
+                    let mut pub_keys: Vec<XOnlyPublicKey> = vec![];
+                    for key_index in key_indices {
+                        let index = key_index.as_u64().unwrap() as usize;
+                        let key = x[index];
+                        let key = XOnlyPublicKey::from_slice(&key).unwrap();
+                        pub_keys.push(key);
+                    }
+
+                    let mut cache = MusigKeyAggCache::new(&secp, &pub_keys);
+
+                    let is_xonly = test_case["is_xonly"].as_array().unwrap()[0]
+                        .as_bool()
+                        .unwrap();
+
+                    let tweak_indices = test_case["tweak_indices"].as_array().unwrap();
+                    let tweak_index = tweak_indices[0].as_u64().unwrap() as usize;
+                    let tweak = t[tweak_index];
+                    let tweak = SecretKey::from_slice(&tweak);
+                    match tweak {
+                        Ok(tweak) => {
+                            let tweak_error = if is_xonly {
+                                cache.pubkey_xonly_tweak_add(&secp, tweak).err().unwrap()
+                            } else {
+                                cache.pubkey_ec_tweak_add(&secp, tweak).err().unwrap()
+                            };
+                            assert_eq!(format!("{:?}", tweak_error), "InvalidTweak".to_string());
+                        }
+                        Err(err) => {
+                            assert_eq!(format!("{:?}", err), "InvalidSecretKey".to_string());
+                        }
+                    }
+                }
+                _ => panic!("Invalid error type."),
+            }
+        }
+    }
+
+    #[test]
+    fn test_nonce_gen_vectors() {
+        // Test fails... Waiting on variable length messages
+        // https://github.com/ElementsProject/secp256k1-zkp/issues/155
+        //
+        // Test fails .. Waiting on musig nonce generation update
+        // https://github.com/ElementsProject/secp256k1-zkp/pull/192
+
+        let secp = Secp256k1::new();
+
+        let test_data = open_json("nonce_gen_vectors.json");
+        let test_elements = test_data.as_object().unwrap();
+
+        let mut test_cases: Vec<Value> = vec![];
+
+        // Unpack and exhaust the json test file.
+        for (elem, value) in test_elements.iter() {
+            match elem.as_str() {
+                "test_cases" => test_cases = value.as_array().unwrap().to_vec(),
+                unexpected => {
+                    panic!("Unexpected test element: {}", unexpected)
+                }
+            }
+        }
+
+        for test_case in test_cases {
+            let rand_ = test_case["rand_"].as_str();
+            let sk = test_case["sk"].as_str();
+            let aggpk = test_case["aggpk"].as_str();
+            let msg = test_case["msg"].as_str();
+            let extra_in = test_case["extra_in"].as_str();
+            let expected = test_case["expected"].as_str();
+
+            let rand_ = rand_.unwrap();
+            let session_id = from_hex_32(rand_).unwrap();
+
+            let sec_key = if let Some(sk) = sk {
+                Some(SecretKey::from_str(sk).unwrap())
+            } else {
+                None
+            };
+
+            let key_agg_cache: MusigKeyAggCache;
+            let key_agg_cache = if let Some(aggpk) = aggpk {
+                let pk = XOnlyPublicKey::from_str(&aggpk).unwrap();
+                key_agg_cache = MusigKeyAggCache::new(&secp, &[pk]);
+                Some(&key_agg_cache)
+            } else {
+                None
+            };
+
+            let msg = if let Some(msg) = msg {
+                // Parse &str as bytes
+                let mut left = char::from_u32(0).unwrap();
+                let mut right: char;
+                let mut bytes: Vec<u8> = vec![];
+                for (i, c) in msg.chars().into_iter().enumerate() {
+                    if i % 2 == 0 {
+                        left = c;
+                    } else {
+                        right = c;
+                        let byte = format!("{}{}", left, right);
+                        let byte = u8::from_str_radix(&byte, 16).unwrap();
+                        bytes.push(byte);
+                    }
+                }
+                let msg = Message::from_slice(&bytes).unwrap();
+                Some(msg)
+            } else {
+                None
+            };
+
+            let extra_rand = if let Some(extra_rand) = extra_in {
+                let extra_rand = from_hex_32(extra_rand).unwrap();
+                Some(extra_rand)
+            } else {
+                None
+            };
+
+            let (sn, _) =
+                new_musig_nonce_pair(&secp, session_id, key_agg_cache, sec_key, msg, extra_rand)
+                    .unwrap();
+
+            // TODO: Turn these into asserts after #155 and #192 get fixed.
+            println!("ex: {}", expected.unwrap());
+            println!("sn: {}", format!("{:?}", sn.0).to_uppercase());
+        }
+    }
+
+    #[test]
+    fn test_nonce_agg_vectors() {
+        let secp = Secp256k1::new();
+
+        let test_data = open_json("nonce_agg_vectors.json");
+        let test_elements = test_data.as_object().unwrap();
+
+        let mut pnonces: Vec<&str> = vec![];
+        let mut valid_test_cases: Vec<Value> = vec![];
+        let mut error_test_cases: Vec<Value> = vec![];
+
+        // Unpack and exhaust the json test file.
+        for (elem, value) in test_elements.iter() {
+            match elem.as_str() {
+                "pnonces" => {
+                    pnonces = value
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap())
+                        .collect();
+                }
+                "valid_test_cases" => {
+                    valid_test_cases = value.as_array().unwrap().to_vec();
+                }
+                "error_test_cases" => {
+                    error_test_cases = value.as_array().unwrap().to_vec();
+                }
+                unexpected => panic!("Unexpected element: {}", unexpected),
+            }
+        }
+
+        for test_case in valid_test_cases {
+            let expected = test_case["expected"].as_str().unwrap();
+            let expected = from_hex_132(expected).unwrap();
+
+            let mut nonces: Vec<MusigPubNonce> = vec![];
+
+            let pnonce_indices: Vec<usize> = test_case["pnonce_indices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+
+            for index in pnonce_indices {
+                let pnonce = from_hex_132(pnonces[index]).unwrap();
+                let pnonce = MusigPubNonce::from_slice(&pnonce).unwrap();
+                nonces.push(pnonce);
+            }
+
+            let result: [u8; 132] = MusigAggNonce::new(&secp, &nonces).serialize();
+            let result = &to_hex(&result);
+            // we swap out g because a test case with the following comment:
+            // "Sum of second points encoded in the nonces is point at infinity
+            // which is serialized as 33 zero bytes"
+            let result = swap_out_g(result).to_uppercase();
+
+            let mut agg_nonce = [0u8; 132];
+            from_hex(&result, &mut agg_nonce).unwrap();
+
+            assert_eq!(agg_nonce, expected);
+        }
+
+        for test_case in error_test_cases.iter() {
+            let error_type = test_case["error"]["type"].as_str().unwrap();
+            match error_type {
+                "invalid_contribution" => {
+                    let key_indices = test_case["pnonce_indices"].as_array().unwrap();
+                    let bad_signer = test_case["error"]["signer"].as_u64().unwrap() as usize;
+                    for (signer, key) in key_indices.iter().enumerate() {
+                        let index = key.as_u64().unwrap() as usize;
+                        let pnonce = from_hex_132(pnonces[index]).unwrap();
+                        let result = MusigPubNonce::from_slice(&pnonce);
+
+                        match result {
+                            Ok(_) => {
+                                assert_ne!(signer, bad_signer);
+                            }
+                            Err(err) => {
+                                assert_eq!(signer, bad_signer);
+                                assert_eq!(format!("{:?}", err), "MalformedArg".to_string());
+                            }
+                        }
+                    }
+                }
+                unexpected => panic!("Unexpected error type: {}", unexpected),
+            }
+        }
+    }
+
+    #[test]
+    fn better_test_sign_verify_vectors() {
+        let secp = Secp256k1::new();
+
+        let test_data = open_json("sign_verify_vectors.json");
+        let test_elements = test_data.as_object().unwrap();
+
+        let mut sk = SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let mut x: Vec<&str> = vec![];
+        let mut secnonce = "";
+        let mut pnonces: Vec<&str> = vec![];
+        let mut aggnonces: Vec<&str> = vec![];
+        let mut msgs: Vec<&str> = vec![];
+        let mut valid_test_cases: Vec<Value> = vec![];
+        let mut sign_error_test_cases: Vec<Value> = vec![];
+        let mut verify_fail_test_cases: Vec<Value> = vec![];
+        let mut verify_error_test_cases: Vec<Value> = vec![];
+
+        // Unpack and exhaust json test file.
+        for (elem, value) in test_elements.iter() {
+            match elem.as_str() {
+                "sk" => {
+                    sk = SecretKey::from_str(value.as_str().unwrap()).unwrap();
+                }
+                "pubkeys" => {
+                    x = value
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap())
+                        .collect();
+                }
+                "secnonce" => secnonce = value.as_str().unwrap(),
+                "pnonces" => {
+                    pnonces = value
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap())
+                        .collect();
+                }
+                "aggnonces" => {
+                    aggnonces = value
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap())
+                        .collect();
+                }
+                "msgs" => {
+                    msgs = value
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap())
+                        .collect();
+                }
+                "valid_test_cases" => valid_test_cases = value.as_array().unwrap().to_vec(),
+                "sign_error_test_cases" => {
+                    sign_error_test_cases = value.as_array().unwrap().to_vec();
+                }
+                "verify_fail_test_cases" => {
+                    verify_fail_test_cases = value.as_array().unwrap().to_vec();
+                }
+                "verify_error_test_cases" => {
+                    verify_error_test_cases = value.as_array().unwrap().to_vec();
+                }
+                unexpected => {
+                    panic!("Encountered unexpected test element: {}", unexpected);
+                }
+            }
+        }
+
+        // The public key corresponding to sk is at index 0
+        let keypair = KeyPair::from_secret_key(&secp, sk);
+        assert_eq!(
+            keypair.public_key(),
+            XOnlyPublicKey::from_str(x[0]).unwrap()
+        );
+
+        // The public nonce corresponding to secnonce is at index 0
+        let k1 = &secnonce[0..64];
+        let k2 = &secnonce[64..];
+        let pn1_as_pk = &pnonces[0][2..66];
+        let pn2_as_pk = &pnonces[0][66..];
+        let kp1 = KeyPair::from_seckey_str(&secp, k1).unwrap();
+        let kp2 = KeyPair::from_seckey_str(&secp, k2).unwrap();
+        let pk1 = XOnlyPublicKey::from_keypair(&kp1);
+        let pk2 = PublicKey::from_keypair(&kp2);
+        let pn1_as_pk = XOnlyPublicKey::from_str(pn1_as_pk).unwrap();
+        let pn2_as_pk = PublicKey::from_str(pn2_as_pk).unwrap();
+        assert_eq!(pk1, pn1_as_pk);
+        assert_eq!(pk2, pn2_as_pk);
+
+        // The aggregate of the first three elements of pnonce is at index 0
+        let pn0 = MusigPubNonce::from_slice(&from_hex_132(pnonces[0]).unwrap()).unwrap();
+        let pn1 = MusigPubNonce::from_slice(&from_hex_132(pnonces[1]).unwrap()).unwrap();
+        let pn2 = MusigPubNonce::from_slice(&from_hex_132(pnonces[2]).unwrap()).unwrap();
+        let aggnonce = MusigAggNonce::new(&secp, &[pn0, pn1, pn2]);
+        let json_aggnonce =
+            MusigAggNonce::from_slice(&from_hex_132(aggnonces[0]).unwrap()).unwrap();
+        assert_eq!(aggnonce, json_aggnonce);
+
+        for valid_test_case in valid_test_cases.iter() {
+            let key_indices = valid_test_case["key_indices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect::<Vec<usize>>();
+            let nonce_indices = valid_test_case["nonce_indices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect::<Vec<usize>>();
+            let aggnonce_index = valid_test_case["aggnonce_index"].as_u64().unwrap() as usize;
+            let msg_index = valid_test_case["msg_index"].as_u64().unwrap() as usize;
+            let signer_index = valid_test_case["signer_index"].as_u64().unwrap() as usize;
+            let expected = valid_test_case["expected"].as_str().unwrap();
+
+            let mut pubkeys: Vec<XOnlyPublicKey> = vec![];
+            for key_index in key_indices {
+                let pk = XOnlyPublicKey::from_str(x[key_index]).unwrap();
+                pubkeys.push(pk);
+            }
+
+            let key_agg_cache = MusigKeyAggCache::new(&secp, &pubkeys);
+
+            let expected_agg_nonce = aggnonces[aggnonce_index];
+            let expected_agg_nonce = swap_in_g(expected_agg_nonce);
+            let expected_agg_nonce = from_hex_132(&expected_agg_nonce).unwrap();
+
+            let expected_agg_nonce = MusigAggNonce::from_slice(&expected_agg_nonce).unwrap();
+
+            let mut nonces: Vec<MusigPubNonce> = vec![];
+            for nonce_index in nonce_indices {
+                let nonce = MusigPubNonce::from_slice(&from_hex_132(pnonces[nonce_index]).unwrap())
+                    .unwrap();
+                nonces.push(nonce);
+            }
+            let agg_nonce = MusigAggNonce::new(&secp, &nonces);
+            assert_eq!(agg_nonce, expected_agg_nonce);
+
+            let msg = msgs[msg_index];
+
+            let filter_155 = msg.len() == 64;
+            if filter_155 {
+                let msg = Message::from_slice(&from_hex_32(msg).unwrap()).unwrap();
+                let session = MusigSession::new(&secp, &key_agg_cache, agg_nonce, msg, None);
+
+                // This secnonce is non-standard and invented for this rust test
+                // suite. The sign_verify_vectors.json file needed a new secnonce
+                // because this rust library will not allow instantiating a secnonce
+                // from bytes.
+                let secnonce_cache = MusigKeyAggCache::new(&secp, &[keypair.public_key()]);
+                let (mut secnonce, _) = secnonce_cache
+                    .nonce_gen(&secp, [0u8; 32], sk, msg, None)
+                    .unwrap();
+
+                println!("aggnonce: {:?}", aggnonce);
+
+                let result = session
+                    .partial_sign(&secp, &mut secnonce, &keypair, &key_agg_cache)
+                    .unwrap();
+
+                println!("expected: {:?}", expected);
+                let expected =
+                    MusigPartialSignature::from_slice(&from_hex_32(expected).unwrap()).unwrap();
+
+                assert_eq!(result, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_sign_verify_vectors() {
+        let secp = Secp256k1::new();
+
+        let x = from_hex_all_32(vec![
+            "F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9",
+            "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659",
+        ])
+        .unwrap();
+        let x = bytes_to_pubkeys(x).unwrap();
+
+        // The public nonce corresponding to our generated sec_nonce is at index 0
+        let pnonce = from_hex_all_132(vec![
+            &("03bd300b42bfe2c60db4c1d426bace4f33ab6cf6200b0417c42ee2406a4079302d".to_owned()
+                + "02e24782231413acd9c61dfd44a4c8513bec402f5d2e3fe5b8a2155d29ade50b68"),
+            &("0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798".to_owned()
+                + "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"),
+            &("032DE2662628C90B03F5E720284EB52FF7D71F4284F627B68A853D78C78E1FFE93".to_owned()
+                + "03E4C5524E83FFE1493B9077CF1CA6BEB2090C93D930321071AD40B2F44E599046"),
+            &("02bd300b42bfe2c60db4c1d426bace4f33ab6cf6200b0417c42ee2406a4079302d".to_owned()
+                + "03e24782231413acd9c61dfd44a4c8513bec402f5d2e3fe5b8a2155d29ade50b68"),
+        ])
+        .unwrap();
+        let pnonce_0 = MusigPubNonce::from_slice(&pnonce[0]).unwrap();
+        let pnonce_1 = MusigPubNonce::from_slice(&pnonce[1]).unwrap();
+        let pnonce_2 = MusigPubNonce::from_slice(&pnonce[2]).unwrap();
+        let pnonce_3 = MusigPubNonce::from_slice(&pnonce[3]).unwrap();
+
+        let expected_agg_nonce = from_hex_all_132(vec![
+            &("0301f336146ccd7ef94758595c663c2ce1e1dea257eba8286e252bb505be62da0e".to_owned()
+                + "023ae13b74626218863efbf7382822718b5c373712cbe39f1107a9de1c47537e51"),
+        ])
+        .unwrap();
+        let expected_agg_nonce = MusigAggNonce::from_slice(&expected_agg_nonce[0]).unwrap();
+        let agg_nonce = MusigAggNonce::new(&secp, &[pnonce_0, pnonce_1, pnonce_2]);
+        assert_eq!(agg_nonce, expected_agg_nonce);
+
+        let sec_key = from_hex_all_32(vec![
+            "7FB9E0E687ADA1EEBF7ECFE2F21E73EBDB51A7D450948DFE8D76D7F2D1007671",
+        ])
+        .unwrap();
+        let sec_key = SecretKey::from_slice(&sec_key[0]).unwrap();
+
+        let keypair = KeyPair::from_secret_key(&secp, sec_key);
+
+        let msg = from_hex_all_32(vec![
+            "F95466D086770E689964664219266FE5ED215C92AE20BAB5C9D79ADDDDF3C0CF",
+        ])
+        .unwrap();
+        let msg = Message::from_slice(&msg[0]).unwrap();
+
+        // Signatures
+        let expected = from_hex_all_32(vec![
+            "6f5034545e7cf0ae5850247eb92972c2c4bad035e8dcaad73ce99788760323fc",
+            "e70863d9f0748822c540da29ccc88951f2d26b591bfe8a17838d5f1dea5a7d2c",
+            "bfff7afe818cc37920bb9f140ebb20a5cfebc9bb9bf14bd88f8ccdc3894ccb68",
+            "8fd1606427ff7f2db3ddeace01d6bfb84f60d8428f9559ec6ae89ac8368eed53",
+        ])
+        .unwrap();
+
+        // Vector 1
+        let key_agg_cache = MusigKeyAggCache::new(&secp, &[keypair.public_key(), x[0], x[1]]);
+
+        let secnonce_cache = MusigKeyAggCache::new(&secp, &[keypair.public_key()]);
+        let (mut secnonce, _) = secnonce_cache
+            .nonce_gen(&secp, [0u8; 32], sec_key, msg, None)
+            .unwrap();
+
+        let session_ctx = MusigSession::new(&secp, &key_agg_cache, agg_nonce, msg, None);
+
+        let vector_1_sig = session_ctx
+            .partial_sign(&secp, &mut secnonce, &keypair, &key_agg_cache)
+            .unwrap()
+            .serialize();
+        assert_eq!(vector_1_sig, expected[0]);
+
+        // Vector 2
+        let key_agg_cache = MusigKeyAggCache::new(&secp, &[x[0], keypair.public_key(), x[1]]);
+
+        let secnonce_cache = MusigKeyAggCache::new(&secp, &[keypair.public_key()]);
+        let (mut secnonce, _) = secnonce_cache
+            .nonce_gen(&secp, [0u8; 32], sec_key, msg, None)
+            .unwrap();
+
+        let session_ctx = MusigSession::new(&secp, &key_agg_cache, agg_nonce, msg, None);
+
+        let vector_2_sig = session_ctx
+            .partial_sign(&secp, &mut secnonce, &keypair, &key_agg_cache)
+            .unwrap()
+            .serialize();
+
+        assert_eq!(vector_2_sig, expected[1]);
+
+        // Vector 3
+        let key_agg_cache = MusigKeyAggCache::new(&secp, &[x[0], x[1], keypair.public_key()]);
+
+        let secnonce_cache = MusigKeyAggCache::new(&secp, &[keypair.public_key()]);
+        let (mut secnonce, _) = secnonce_cache
+            .nonce_gen(&secp, [0u8; 32], sec_key, msg, None)
+            .unwrap();
+
+        let session_ctx = MusigSession::new(&secp, &key_agg_cache, agg_nonce, msg, None);
+
+        let vector_3_sig = session_ctx
+            .partial_sign(&secp, &mut secnonce, &keypair, &key_agg_cache)
+            .unwrap()
+            .serialize();
+        assert_eq!(vector_3_sig, expected[2]);
+
+        // Vector 4: Both halves of aggregate nonce correspond to point at infinity
+        // secp256k1-zkp nonce aggregation returns G as infinity.
+        let g_is_infinity = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817980279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let g_is_infinity = from_hex_all_132(vec![g_is_infinity]).unwrap();
+        let g_is_infinity = MusigAggNonce::from_slice(&g_is_infinity[0]).unwrap();
+        let inf_aggnonce = MusigAggNonce::new(&secp, &[pnonce_0, pnonce_3]);
+        assert_eq!(inf_aggnonce, g_is_infinity);
+
+        let key_agg_cache = MusigKeyAggCache::new(&secp, &[keypair.public_key(), x[0]]);
+
+        let secnonce_cache = MusigKeyAggCache::new(&secp, &[keypair.public_key()]);
+        let (mut secnonce, _) = secnonce_cache
+            .nonce_gen(&secp, [0u8; 32], sec_key, msg, None)
+            .unwrap();
+        println!("Sec nonce: {:?}", secnonce);
+        let session_ctx = MusigSession::new(&secp, &key_agg_cache, inf_aggnonce, msg, None);
+
+        let vector_4_sig = session_ctx
+            .partial_sign(&secp, &mut secnonce, &keypair, &key_agg_cache)
+            .unwrap()
+            .serialize();
+        let mut foo = format!("{:02x?}", vector_4_sig);
+        foo.retain(|c| "0123456789abcdefABCDEF".contains(c));
+        println!("foo: {}", foo);
+        assert_eq!(vector_4_sig, expected[3]);
+
+        // Vector 5: Signer 2 provided an invalid public key
+        // Skipping Vector 5 becasue we have already tested invalid public keys in fn test_errors().
+
+        // Vector 6: Aggregate nonce is invalid due wrong tag, 0x04, in the first half.
+        let invalid_agg = from_hex_all_132(vec![
+            &("048465FCF0BBDBCF443AABCCE533D42B4B5A10966AC09A49655E8C42DAAB8FCD61".to_owned()
+                + "037496A3CC86926D452CAFCFD55D25972CA1675D549310DE296BFF42F72EEEA8C9"),
+        ])
+        .unwrap();
+        let invalid_agg = MusigAggNonce::from_slice(&invalid_agg[0]).err().unwrap();
+        assert_eq!(format!("{}", invalid_agg), "Malformed parse argument");
+
+        // Vector 7: Aggregate nonce is invalid because the second half does not
+        // correspond to an X coordinate
+        let invalid_agg = from_hex_all_132(vec![
+            &("028465FCF0BBDBCF443AABCCE533D42B4B5A10966AC09A49655E8C42DAAB8FCD61".to_owned()
+                + "020000000000000000000000000000000000000000000000000000000000000009"),
+        ])
+        .unwrap();
+        let invalid_agg = MusigAggNonce::from_slice(&invalid_agg[0]).err().unwrap();
+        assert_eq!(format!("{}", invalid_agg), "Malformed parse argument");
+
+        // Vector 8: Vector 8: Aggregate nonce is invalid because second half
+        // exceeds field size
+        let invalid_agg = from_hex_all_132(vec![
+            &("028465FCF0BBDBCF443AABCCE533D42B4B5A10966AC09A49655E8C42DAAB8FCD61".to_owned()
+                + "02FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC30"),
+        ])
+        .unwrap();
+        let invalid_agg = MusigAggNonce::from_slice(&invalid_agg[0]).err().unwrap();
+        assert_eq!(format!("{}", invalid_agg), "Malformed parse argument");
+
+        // Verification test vectors
+        // Vector 9
+        let key_agg_cache = MusigKeyAggCache::new(&secp, &[keypair.public_key(), x[0], x[1]]);
+        let agg_nonce = MusigAggNonce::new(&secp, &[pnonce_0, pnonce_1, pnonce_2]);
+        let session = MusigSession::new(&secp, &key_agg_cache, agg_nonce, msg, None);
+        let partial_sig = MusigPartialSignature::from_slice(&expected[0]).unwrap();
+        // Agg nonce of the signer.
+        let agg_nonce = MusigAggNonce::new(&secp, &[pnonce_0]);
+        // Pub nonce of the signer.
+        let pub_nonce = MusigPubNonce::from_slice(&agg_nonce.serialize()).unwrap();
+        assert!(session.partial_verify(
+            &secp,
+            &key_agg_cache,
+            partial_sig,
+            pub_nonce,
+            keypair.public_key(),
+        ));
+        //assert partial_sig_verify(expected[0], [pnonce[0], pnonce[1], pnonce[2]], [pk, X[0], X[1]], [], [], msg, 0)
+
+        // Vector 10
+        let key_agg_cache = MusigKeyAggCache::new(&secp, &[x[0], keypair.public_key(), x[1]]);
+        let agg_nonce = MusigAggNonce::new(&secp, &[pnonce_1, pnonce_0, pnonce_2]);
+        let session = MusigSession::new(&secp, &key_agg_cache, agg_nonce, msg, None);
+        let partial_sig = MusigPartialSignature::from_slice(&expected[1]).unwrap();
+        // Agg nonce of the signer.
+        let agg_nonce = MusigAggNonce::new(&secp, &[pnonce_0]);
+        // Pub nonce of the signer.
+        let pub_nonce = MusigPubNonce::from_slice(&agg_nonce.serialize()).unwrap();
+        assert!(session.partial_verify(
+            &secp,
+            &key_agg_cache,
+            partial_sig,
+            pub_nonce,
+            keypair.public_key(),
+        ));
+        //assert partial_sig_verify(expected[1], [pnonce[1], pnonce[0], pnonce[2]], [X[0], pk, X[1]], [], [], msg, 1)
+
+        // Vector 11
+        let key_agg_cache = MusigKeyAggCache::new(&secp, &[x[0], x[1], keypair.public_key()]);
+        let agg_nonce = MusigAggNonce::new(&secp, &[pnonce_1, pnonce_2, pnonce_0]);
+        let session = MusigSession::new(&secp, &key_agg_cache, agg_nonce, msg, None);
+        let partial_sig = MusigPartialSignature::from_slice(&expected[2]).unwrap();
+        // Agg nonce of the signer.
+        let agg_nonce = MusigAggNonce::new(&secp, &[pnonce_0]);
+        // Pub nonce of the signer.
+        let pub_nonce = MusigPubNonce::from_slice(&agg_nonce.serialize()).unwrap();
+        assert!(session.partial_verify(
+            &secp,
+            &key_agg_cache,
+            partial_sig,
+            pub_nonce,
+            keypair.public_key(),
+        ));
+        //assert partial_sig_verify(expected[2], [pnonce[1], pnonce[2], pnonce[0]], [X[0], X[1], pk], [], [], msg, 2)
+
+        // Vector 12: Both halves of aggregate nonce correspond to point at infinity
+        let agg_nonce = MusigAggNonce::new(&secp, &[pnonce_0, pnonce_3]);
+        assert_eq!(agg_nonce, inf_aggnonce);
+        let key_agg_cache = MusigKeyAggCache::new(&secp, &[keypair.public_key(), x[0]]);
+        let session = MusigSession::new(&secp, &key_agg_cache, agg_nonce, msg, None);
+        let partial_sig = MusigPartialSignature::from_slice(&expected[3]).unwrap();
+        // Agg nonce of the signer.
+        let agg_nonce = MusigAggNonce::new(&secp, &[pnonce_0]);
+        // Pub nonce of the signer.
+        let pub_nonce = MusigPubNonce::from_slice(&agg_nonce.serialize()).unwrap();
+        assert!(session.partial_verify(
+            &secp,
+            &key_agg_cache,
+            partial_sig,
+            pub_nonce,
+            keypair.public_key(),
+        ));
+        // assert partial_sig_verify(expected[3], [pnonce[0], pnonce[3]], [pk, X[0]], [], [], msg, 0)
+
+        // Vector 13: Wrong signature (which is equal to the negation of valid signature expected[0])
+        // TODO: Learn to generate this wrong signature.
+        let wrong_sig = from_hex_all_32(vec![
+            "97AC833ADCB1AFA42EBF9E0725616F3C9A0D5B614F6FE283CEAAA37A8FFAF406",
+        ])
+        .unwrap();
+        let goodsig = expected[0];
+        let foo = Signature::from_slice(&goodsig).unwrap();
+        let wrong_sig = MusigPartialSignature::from_slice(&wrong_sig[0]).unwrap();
+        let key_agg_cache = MusigKeyAggCache::new(&secp, &[keypair.public_key(), x[0], x[1]]);
+        let agg_nonce = MusigAggNonce::new(&secp, &[pnonce_0, pnonce_1, pnonce_2, pnonce_3]);
+        let pub_nonce = MusigPubNonce::from_slice(&agg_nonce.serialize()).unwrap();
+        let session = MusigSession::new(&secp, &key_agg_cache, agg_nonce, msg, None);
+        assert!(!session.partial_verify(
+            &secp,
+            &key_agg_cache,
+            wrong_sig,
+            pub_nonce,
+            keypair.public_key(),
+        ));
+        //  assert not partial_sig_verify(wrong_sig, pnonce, [pk, X[0], X[1]], [], [], msg, 0)
+
+        // Vector 14: Wrong signer
+        // TODO: The python version of this seems to test with pnonce_3 which it probably shouldn't??
+        let key_agg_cache = MusigKeyAggCache::new(&secp, &[keypair.public_key(), x[0], x[1]]);
+        let agg_nonce = MusigAggNonce::new(&secp, &[pnonce_0, pnonce_1, pnonce_2]);
+        let session = MusigSession::new(&secp, &key_agg_cache, agg_nonce, msg, None);
+        let partial_sig = MusigPartialSignature::from_slice(&expected[0]).unwrap();
+        // Agg nonce of the signer.
+        let pub_nonce = MusigAggNonce::new(&secp, &[pnonce_0]);
+        // Pub nonce of the signer.
+        let pub_nonce = MusigPubNonce::from_slice(&pub_nonce.serialize()).unwrap();
+        assert!(session.partial_verify(
+            &secp,
+            &key_agg_cache,
+            partial_sig,
+            pub_nonce,
+            keypair.public_key(),
+        ));
+        let key_agg_cache = MusigKeyAggCache::new(&secp, &[keypair.public_key(), x[0], x[1]]);
+        let agg_nonce = MusigAggNonce::new(&secp, &[pnonce_0, pnonce_1, pnonce_2]);
+        let session = MusigSession::new(&secp, &key_agg_cache, agg_nonce, msg, None);
+        let partial_sig = MusigPartialSignature::from_slice(&expected[0]).unwrap();
+        // Agg nonce of the signer.
+        let pub_nonce = MusigAggNonce::new(&secp, &[pnonce_0]);
+        // Pub nonce of the signer.
+        let pub_nonce = MusigPubNonce::from_slice(&pub_nonce.serialize()).unwrap();
+        assert!(!session.partial_verify(&secp, &key_agg_cache, partial_sig, pub_nonce, x[0],));
+        // assert not partial_sig_verify(expected[0], pnonce, [pk, X[0], X[1]], [], [], msg, 1)
+
+        // Vector 15: Signature exceeds group size
+        let wrong_sig = from_hex_all_32(vec![
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+        ])
+        .unwrap();
+        let wrong_sig = MusigPartialSignature::from_slice(&wrong_sig[0])
+            .err()
+            .unwrap();
+        assert_eq!(format!("{}", wrong_sig), "Malformed parse argument");
+
+        // Vector 16: Invalid pubnonce
+        // There are too many bytes in the public nonce. That's why it fails. No need to test in rust.
+        // let invalid_pubnonce = from_hex_all_32(vec![
+        //     "020000000000000000000000000000000000000000000000000000000000000009",
+        // ])
+        // .unwrap();
+
+        // Vector 17: Invalid public key
+        // Skipping Vector 17 becasue we have already tested invalid public keys in fn test_errors()
+    }
 
     #[test]
     fn test_key_agg_cache() {
